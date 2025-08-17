@@ -1,3 +1,9 @@
 streamlit
-rembg
-Pillow
+pillow
+torch
+torchvision
+transformers
+timm
+requests
+einops
+kornia

@@ -1,28 +1,47 @@
-# 🪄 Background Remover (rembg + U²-Net)
 
-A simple Streamlit app to remove image backgrounds using the [rembg](https://github.com/danielgatis/rembg) library and U²-Net model.
+# � Background Remover (BiRefNet, Streamlit)
+
+An advanced Streamlit app for removing image backgrounds using [BiRefNet](https://huggingface.co/ZhengPeng7/BiRefNet) models. Supports NVIDIA, AMD ROCm (Linux), and AMD DirectML (Windows) GPUs.
 
 ## Features
-- Upload images (PNG, JPG, JPEG, WEBP)
-- Remove background with U²-Net
-- Optional alpha matting for better edges
-- Choose output background: Transparent, White, Black, or Alpha only
-- Download the processed image
+- Upload or URL input for images (PNG, JPG, JPEG, WEBP)
+- BiRefNet model picker (general, HR, matting, dynamic)
+- Aspect-ratio–preserving letterboxing (no distortion)
+- Soft alpha by default, optional threshold + feathering
+- GPU acceleration: CUDA (NVIDIA), ROCm (AMD/Linux), DirectML (AMD/Windows)
+- Download transparent PNG result
+
+## Installation
+
+### A) Linux + AMD ROCm (recommended for AMD)
+```bash
+pip install --index-url https://download.pytorch.org/whl/rocm6.1 torch torchvision torchaudio
+pip install streamlit pillow transformers timm requests einops kornia
+```
+Verify: `python -c "import torch; print(torch.cuda.is_available(), torch.version.hip)"` → should print `True` and a HIP version.
+
+### B) Windows + AMD via DirectML (experimental)
+```bash
+pip install torch-directml
+pip install streamlit pillow torchvision transformers timm requests einops kornia
+```
+Note: Autocast/mixed precision is disabled on DirectML; performance varies by GPU and driver.
+
+### C) NVIDIA (Linux/Windows)
+```bash
+pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121
+pip install streamlit pillow transformers timm requests einops kornia
+```
 
 ## Usage
-1. Install requirements:
-   ```bash
-   pip install -r requirements.txt
-   ```
-2. Run the app:
-   ```bash
-   streamlit run app.py
-   ```
-3. Open the provided local URL in your browser.
+```bash
+streamlit run app.py
+```
+Then open the provided local URL in your browser.
 
 ## Screenshot
 ![screenshot](screenshot.png)
 
 ---
 
-Made with ❤️ using [Streamlit](https://streamlit.io/) and [rembg](https://github.com/danielgatis/rembg).
+Made with ❤️ using [Streamlit](https://streamlit.io/) and [BiRefNet](https://huggingface.co/ZhengPeng7/BiRefNet).

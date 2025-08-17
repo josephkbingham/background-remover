@@ -1,7 +1,10 @@
 streamlit==1.48.1
 transformers==4.55.2
-torch==2.4.0
-torchvision==0.19.0
+# Updated to Python 3.13-compatible torch/torchvision (2.5.0/0.20.0)
+torch==2.5.0
+torchvision==0.20.0
 pillow==11.0.0
 requests==2.32.3
 timm==0.9.16
+einops==0.8.0
+kornia==0.7.2

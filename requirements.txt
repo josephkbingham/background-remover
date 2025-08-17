@@ -1,7 +1,7 @@
 streamlit==1.48.1
 transformers==4.55.2
-# Python 3.13-compatible torch/torchvision pair (0.20.0 wheel not published for 3.13, using 0.21.0)
-torch==2.5.0
+# Python 3.13 Streamlit Cloud compatible pair (torchvision 0.21.0 requires torch 2.6.0)
+torch==2.6.0
 torchvision==0.21.0
 pillow==11.0.0
 requests==2.32.3

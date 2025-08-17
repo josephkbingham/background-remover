@@ -1,5 +1,5 @@
 """
-Streamlit Background Removal App (BiRefNet) — NVIDIA, AMD ROCm, and AMD (Windows) DirectML
+Streamlit Background Removal App (BiRefNet) — CPU/Streamlit Cloud, NVIDIA, AMD ROCm, and AMD (Windows) DirectML
 
 Key upgrades for AMD users:
 - **ROCm (Linux):** Works out of the box with this script if you install the ROCm build of PyTorch. `torch.cuda.is_available()` will return True and the device string is still "cuda" (even on AMD under ROCm).
@@ -11,7 +11,25 @@ Other improvements retained:
 - Soft alpha by default, optional threshold + feathering
 - URL or file input, previews, and a Download Transparent PNG button
 
-Requirements (choose one of the GPU paths below):
+Requirements (for Streamlit Cloud & local):
+
+**0) Streamlit Cloud (no GPU)** — recommended pins
+Create a `requirements.txt` like this (CPU-only wheels to avoid accidental CUDA packages):
+```
+streamlit==1.48.1
+transformers==4.55.2
+# CPU-only Torch + torchvision; pick a pair supported by Streamlit Cloud's Python (3.11 is safest)
+torch==2.4.0
+torchvision==0.19.0
+pillow==11.0.0
+requests==2.32.3
+timm==0.9.16
+```
+Add `runtime.txt` with:
+```
+3.11
+```
+This prevents Python 3.13 edge-cases and keeps wheels available.
 
 **A) Linux + AMD ROCm (recommended for AMD)**
 ```
@@ -32,11 +50,15 @@ Run:
 ```
 streamlit run streamlit_birefnet_bg_removal.py
 ```
+```
+streamlit run streamlit_birefnet_bg_removal.py
+```
 """
 
 from __future__ import annotations
 import io
 import time
+import os
 from dataclasses import dataclass
 from typing import Optional, Tuple
 
@@ -139,28 +161,34 @@ def make_transform(img_size: int) -> transforms.Compose:
 # Device selection (CUDA/ROCm, DirectML, CPU)
 # -------------------------
 
-def pick_device() -> Tuple[str, object]:
-    """Return (device_label, device_obj) for use with .to().
-    - ROCm shows up as CUDA in PyTorch; torch.cuda.is_available() == True
-    - DirectML uses torch_directml; return its device object
-    - CPU returns ("cpu", "cpu")
+def pick_device(force_cpu: bool = False) -> Tuple[str, object]:
+    """Return (device_label, device_obj).
+    If force_cpu=True, always return CPU (useful for Streamlit Cloud).
     """
+    if force_cpu:
+        return "cpu", "cpu"
     if torch.cuda.is_available():
         return "cuda", "cuda"
     if HAS_DML:
         return "directml", tdm.device()
     return "cpu", "cpu"
 
-DEVICE_LABEL, DEVICE_OBJ = pick_device()
+# Force CPU by default on Streamlit Cloud (set via env or sidebar)
+DEFAULT_FORCE_CPU = bool(os.environ.get("STREAMLIT_RUNTIME") or os.environ.get("STREAMLIT_SERVER_ENABLED"))
+DEVICE_LABEL, DEVICE_OBJ = pick_device(force_cpu=DEFAULT_FORCE_CPU)
 
 # -------------------------
 # Model Loader (cached)
 # -------------------------
 
 @st.cache_resource(show_spinner=True)
-def load_model(repo_id: str, device_obj):
+def load_model(repo_id: str, device_obj, pin_revision: str | None = None):
+    # Pin a revision to avoid unexpected upstream code changes on Cloud
+    kwargs = {"trust_remote_code": True}
+    if pin_revision:
+        kwargs["revision"] = pin_revision
     model = AutoModelForImageSegmentation.from_pretrained(
-        repo_id, trust_remote_code=True
+        repo_id, **kwargs
     )
     model.eval()
     model.to(device_obj)
@@ -256,9 +284,16 @@ with st.sidebar:
     model_label = st.selectbox("Model", list(MODEL_CHOICES.keys()), index=2)
     repo_id = MODEL_CHOICES[model_label]
 
+    force_cpu = st.checkbox("Force CPU (Streamlit Cloud)", value=DEFAULT_FORCE_CPU,
+                            help="Cloud has no GPU. Disable locally if you have CUDA/ROCm/DirectML.")
+    if (force_cpu and DEVICE_LABEL != "cpu") or ((not force_cpu) and DEVICE_LABEL == "cpu" and torch.cuda.is_available()):
+        # Re-pick device based on toggle
+        DEVICE_LABEL, DEVICE_OBJ = pick_device(force_cpu=force_cpu)
+
     st.write(f"**Device:** {DEVICE_LABEL}")
 
-    input_side = st.slider("Network input size (square)", 512, 2048, 1024, step=128)
+    input_side = st.slider("Network input size (square)", 512, 1536, 896, step=64,
+                           help="Lower sizes save RAM on Cloud; 768–1024 is a good balance.")
     use_letterbox = st.checkbox(
         "Letterbox to square (preserve aspect)",
         value=True,
@@ -270,7 +305,6 @@ with st.sidebar:
         help="Enabled only on CUDA/ROCm. Disabled on DirectML/CPU.",
     )
 
-    # Disable autocast toggle if not CUDA
     if DEVICE_LABEL != "cuda":
         use_autocast = False
 
@@ -281,7 +315,9 @@ with st.sidebar:
     invert = st.checkbox("Invert mask (keep background)", value=False)
 
 # Load model (cached)
-model = load_model(repo_id, DEVICE_OBJ)
+# Pin to a known-good revision (update this if you want newer features)
+PINNED_REV = "main"  # replace with a commit hash from the HF model card for reproducibility
+model = load_model(repo_id, DEVICE_OBJ, pin_revision=PINNED_REV)
 
 # Inputs
 left, right = st.columns(2)
@@ -308,26 +344,30 @@ elif url:
 if img is not None:
     c1, c2 = st.columns(2)
     with st.spinner("Running BiRefNet…"):
-        t0 = time.perf_counter()
-        mask = run_birefnet(
-            img_rgb=img,
-            model=model,
-            device_label=DEVICE_LABEL,
-            device_obj=DEVICE_OBJ,
-            input_side=input_side,
-            use_letterbox=use_letterbox,
-            use_autocast=use_autocast,
-        )
-        t1 = time.perf_counter()
+        try:
+            t0 = time.perf_counter()
+            mask = run_birefnet(
+                img_rgb=img,
+                model=model,
+                device_label=DEVICE_LABEL,
+                device_obj=DEVICE_OBJ,
+                input_side=input_side,
+                use_letterbox=use_letterbox,
+                use_autocast=use_autocast,
+            )
+            t1 = time.perf_counter()
 
-        result = compose_alpha(
-            img_rgb=img,
-            mask=mask,
-            threshold=threshold,
-            feather_radius=feather,
-            invert=invert,
-        )
-        t2 = time.perf_counter()
+            result = compose_alpha(
+                img_rgb=img,
+                mask=mask,
+                threshold=threshold,
+                feather_radius=feather,
+                invert=invert,
+            )
+            t2 = time.perf_counter()
+        except Exception as e:
+            st.exception(e)
+            st.stop()
 
     with c1:
         st.markdown("**Original**")

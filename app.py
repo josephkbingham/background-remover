@@ -67,7 +67,15 @@ import streamlit as st
 import torch
 from PIL import Image, ImageFilter
 from torchvision import transforms
-from transformers import AutoModelForImageSegmentation
+# Some lightweight transformer builds (or older wheels on certain Python versions) may
+# not expose AutoModelForImageSegmentation. Fallback to generic AutoModel.
+try:  # pragma: no cover - environment dependent
+    from transformers import AutoModelForImageSegmentation as _SegModelClass
+except Exception:  # ImportError or AttributeError
+    from transformers import AutoModel as _SegModelClass  # type: ignore
+    SEG_FALLBACK = True
+else:
+    SEG_FALLBACK = False
 
 # Try to enable DirectML on Windows if CUDA/ROCm is not available
 try:
@@ -187,9 +195,7 @@ def load_model(repo_id: str, device_obj, pin_revision: str | None = None):
     kwargs = {"trust_remote_code": True}
     if pin_revision:
         kwargs["revision"] = pin_revision
-    model = AutoModelForImageSegmentation.from_pretrained(
-        repo_id, **kwargs
-    )
+    model = _SegModelClass.from_pretrained(repo_id, **kwargs)
     model.eval()
     model.to(device_obj)
     return model
@@ -278,6 +284,9 @@ def compose_alpha(
 
 st.set_page_config(page_title="BiRefNet Background Removal", layout="wide")
 st.title("🧼 Background Removal (BiRefNet)")
+
+if 'SEG_FALLBACK' in globals() and SEG_FALLBACK:
+    st.warning("Using generic AutoModel fallback (AutoModelForImageSegmentation unavailable). Functionality may be reduced; upgrade transformers on local environment for full support.")
 
 with st.sidebar:
     st.header("Model & Inference Settings")

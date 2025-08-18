@@ -300,126 +300,73 @@ def call_hf_endpoint(
     hf_token: str,
     timeout: int = 120,
     debug: bool = False,
+    source_url: Optional[str] = None,
 ) -> Tuple[Optional[bytes], Optional[Image.Image]]:
-    """Robust multi‑strategy call to a HF Inference Endpoint.
-    Tries several common payload formats:
-      1) Raw bytes (application/octet-stream)
-      2) Raw bytes (image/png)
-      3) JSON base64 {"inputs": b64}
-      4) JSON base64 {"image": b64}
-    Interprets responses as either:
-      - direct PNG (mask or final image)
-      - JSON with *png_b64 keys or numeric mask list
-    Returns (mask_png_bytes, rgba_image) where only one is populated.
-    Raises RuntimeError with aggregated attempt info on failure.
-    """
+    """Directly calls a HF Inference Endpoint with the expected payload format."""
+    
+    # 1. Convert the image to bytes and then encode it as a base64 string.
     buf = io.BytesIO()
     image.save(buf, format="PNG")
     img_bytes = buf.getvalue()
+    b64_string = base64.b64encode(img_bytes).decode("utf-8")
 
-    common_headers = {
+    # 2. Construct the JSON payload in the required format.
+    #    This is the structure the endpoint hint specified: {'inputs': {'image': b64}}
+    payload = {
+        "inputs": {
+            "image": b64_string
+        }
+    }
+    
+    # 3. Set up the required headers for authorization and content type.
+    headers = {
         "Authorization": f"Bearer {hf_token}" if hf_token else "",
-        "Accept": "image/png,application/json",
+        "Content-Type": "application/json",
+        "Accept": "image/png,application/json", # Accept both for flexible responses
     }
 
-    attempts = []  # (label, status_code, snippet)
+    # 4. Make the request directly with the correct payload.
+    try:
+        response = requests.post(endpoint_url, headers=headers, json=payload, timeout=timeout)
+        response.raise_for_status() # This will raise an HTTPError for bad responses (4xx or 5xx)
+    except requests.exceptions.RequestException as e:
+        # Catch network errors, timeouts, and bad status codes
+        raise RuntimeError(f"Endpoint request failed: {e}") from e
 
-    def _try(label: str, *, headers: dict, data=None, json_payload=None):
-        try:
-            r = requests.post(
-                endpoint_url,
-                headers=headers,
-                data=data,
-                json=json_payload,
-                timeout=timeout,
-            )
-        except Exception as ex:  # network / timeout
-            attempts.append((label, "EXC", str(ex)[:180]))
-            return None
-        if r.ok:
-            return r
-        # Record failing attempt with body snippet
-        attempts.append((label, r.status_code, r.text[:180]))
-        return None
-
-    b64 = base64.b64encode(img_bytes).decode()
-
-    # Strategy executions
-    resp = _try(
-        "raw-octet",
-        headers={**common_headers, "Content-Type": "application/octet-stream"},
-        data=img_bytes,
-    ) or _try(
-        "raw-png",
-        headers={**common_headers, "Content-Type": "image/png"},
-        data=img_bytes,
-    ) or _try(
-        "json-inputs",
-        headers={**common_headers, "Content-Type": "application/json"},
-        json_payload={"inputs": b64},
-    ) or _try(
-        "json-image",
-        headers={**common_headers, "Content-Type": "application/json"},
-        json_payload={"image": b64},
-    ) or _try(
-        "json-nested-image",
-        headers={**common_headers, "Content-Type": "application/json"},
-        json_payload={"inputs": {"image": b64}},
-    ) or _try(
-        "json-nested-bytes",
-        headers={**common_headers, "Content-Type": "application/json"},
-        json_payload={"inputs": {"bytes": b64}},
-    )
-
-    if resp is None:
-        detail = " | ".join(f"{m}:{c}:{s}" for m, c, s in attempts)
-        hint = "If your endpoint expects a public image URL, supply one via the 'URL' field instead of upload and choose 'Use endpoint'. Or modify server to accept base64 in {'inputs': {'image': b64}}."  # noqa: E501
-        raise RuntimeError(f"Endpoint attempts failed: {detail}\nHint: {hint}")
-
-    ctype = resp.headers.get("Content-Type", "")
-    content = resp.content
-
-    # Direct image path
-    if ctype.startswith("image/") or ctype == "application/octet-stream":
+    # 5. Process the response.
+    ctype = response.headers.get("Content-Type", "")
+    content = response.content
+    
+    # If the endpoint returns an image directly
+    if ctype.startswith("image/"):
         return content, None
 
-    # JSON path
-    try:
-        js = resp.json()
-    except Exception:
-        raise RuntimeError(
-            f"Unexpected endpoint response (Content-Type={ctype}, len={len(content)})."
-        )
-
-    if debug:
-        st.code({k: (str(v)[:120] + '…' if isinstance(v, str) and len(v) > 120 else v) for k, v in list(js.items())[:8]})
-
-    if isinstance(js, dict):
-        # Base64 PNG variants
-        for key in ("mask_png_b64", "image_png_b64", "mask", "image"):
-            val = js.get(key)
-            if isinstance(val, str):
-                try:
-                    raw = base64.b64decode(val)
-                except Exception:
-                    continue
-                if raw[:8] == PNG_MAGIC:
-                    return raw, None
-                # Try treat as full image
-                try:
-                    im = Image.open(io.BytesIO(raw))
-                    return None, im.convert("RGBA")
-                except Exception:
-                    continue
-        # Numeric mask list
-        if isinstance(js.get("mask"), list):
-            try:
+    # If the endpoint returns JSON (e.g., with a base64 encoded image)
+    if ctype.startswith("application/json"):
+        try:
+            js = response.json()
+            if debug:
+                st.code({k: (str(v)[:120] + '…' if isinstance(v, str) and len(v) > 120 else v) for k, v in list(js.items())[:8]})
+            
+            # Look for a base64 encoded image in the response
+            for key in ("mask_png_b64", "image_png_b64", "mask", "image"):
+                val = js.get(key)
+                if isinstance(val, str):
+                    try:
+                        raw = base64.b64decode(val)
+                        if raw[:8] == PNG_MAGIC: # Check if it's a valid PNG
+                             return raw, None
+                    except Exception:
+                        continue # Ignore if decoding fails
+            
+            # Handle numeric mask list
+            if isinstance(js.get("mask"), list):
                 return numeric_mask_to_png_bytes(js["mask"]), None
-            except Exception as ex:
-                raise RuntimeError(f"Failed to convert numeric mask: {ex}")
+                
+        except Exception as e:
+            raise RuntimeError(f"Failed to parse JSON response: {e}") from e
 
-    raise RuntimeError("Could not interpret endpoint JSON. Provide PNG bytes or *png_b64 key.")
-
+    raise RuntimeError(f"Could not interpret endpoint response. Content-Type: {ctype}")
 # -------------------------
 # Streamlit UI
 # -------------------------

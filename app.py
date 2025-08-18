@@ -361,11 +361,20 @@ def call_hf_endpoint(
         "json-image",
         headers={**common_headers, "Content-Type": "application/json"},
         json_payload={"image": b64},
+    ) or _try(
+        "json-nested-image",
+        headers={**common_headers, "Content-Type": "application/json"},
+        json_payload={"inputs": {"image": b64}},
+    ) or _try(
+        "json-nested-bytes",
+        headers={**common_headers, "Content-Type": "application/json"},
+        json_payload={"inputs": {"bytes": b64}},
     )
 
     if resp is None:
         detail = " | ".join(f"{m}:{c}:{s}" for m, c, s in attempts)
-        raise RuntimeError(f"Endpoint attempts failed: {detail}")
+        hint = "If your endpoint expects a public image URL, supply one via the 'URL' field instead of upload and choose 'Use endpoint'. Or modify server to accept base64 in {'inputs': {'image': b64}}."  # noqa: E501
+        raise RuntimeError(f"Endpoint attempts failed: {detail}\nHint: {hint}")
 
     ctype = resp.headers.get("Content-Type", "")
     content = resp.content

@@ -1,15 +1,18 @@
 """
-Streamlit Background Removal App (BiRefNet) — CPU/Streamlit Cloud, NVIDIA, AMD ROCm, and AMD (Windows) DirectML
+Streamlit Background Removal App (BiRefNet) — CPU/Streamlit Cloud, NVIDIA, AMD ROCm, AMD (Windows) DirectML, or Remote HF Endpoint
 
 Key upgrades for AMD users:
 - **ROCm (Linux):** Works out of the box with this script if you install the ROCm build of PyTorch. `torch.cuda.is_available()` will return True and the device string is still "cuda" (even on AMD under ROCm).
 - **DirectML (Windows):** Optional fallback using `torch-directml`. If ROCm/"cuda" is not available but DirectML is, the app runs on `DirectML` with minimal changes. (Autocast is disabled on DirectML.)
 
-Other improvements retained:
+Other improvements retained / added:
 - Aspect‑ratio–preserving letterboxing (unpadding to original size)
 - Model picker (general, HR, matting, dynamic variants)
 - Soft alpha by default, optional threshold + feathering
 - URL or file input, previews, and a Download Transparent PNG button
+- **NEW:** Optional **Hugging Face Inference Endpoint** client (no local model). Provide your endpoint URL + token and the app will call it and composite the returned mask/result.
+- **NEW:** Endpoint return-type toggle (mask vs final RGBA) so binary responses are interpreted correctly.
+- **NEW:** Built‑in diagnostics & unit tests you can run from the sidebar.
 
 Requirements (for Streamlit Cloud & local):
 
@@ -50,9 +53,6 @@ Run:
 ```
 streamlit run streamlit_birefnet_bg_removal.py
 ```
-```
-streamlit run streamlit_birefnet_bg_removal.py
-```
 """
 
 from __future__ import annotations
@@ -63,19 +63,12 @@ from dataclasses import dataclass
 from typing import Optional, Tuple
 
 import requests
+import base64
 import streamlit as st
 import torch
 from PIL import Image, ImageFilter
 from torchvision import transforms
-# Some lightweight transformer builds (or older wheels on certain Python versions) may
-# not expose AutoModelForImageSegmentation. Fallback to generic AutoModel.
-try:  # pragma: no cover - environment dependent
-    from transformers import AutoModelForImageSegmentation as _SegModelClass
-except Exception:  # ImportError or AttributeError
-    from transformers import AutoModel as _SegModelClass  # type: ignore
-    SEG_FALLBACK = True
-else:
-    SEG_FALLBACK = False
+from transformers import AutoModelForImageSegmentation
 
 # Try to enable DirectML on Windows if CUDA/ROCm is not available
 try:
@@ -89,6 +82,10 @@ except Exception:
 # Configuration & Utilities
 # -------------------------
 
+# Default: read HF endpoint config from env/secrets if present
+DEFAULT_ENDPOINT_URL = os.environ.get("HF_ENDPOINT_URL", "")
+DEFAULT_HF_TOKEN = os.environ.get("HF_TOKEN", "")
+
 torch.set_float32_matmul_precision("high")  # fast matmul where possible
 
 MODEL_CHOICES = {
@@ -101,6 +98,8 @@ MODEL_CHOICES = {
 
 IMAGENET_MEAN = [0.485, 0.456, 0.406]
 IMAGENET_STD = [0.229, 0.224, 0.225]
+
+PNG_MAGIC = b"\x89PNG\r\n\x1a\n"  # 8-byte PNG signature
 
 @dataclass
 class LetterboxInfo:
@@ -195,13 +194,15 @@ def load_model(repo_id: str, device_obj, pin_revision: str | None = None):
     kwargs = {"trust_remote_code": True}
     if pin_revision:
         kwargs["revision"] = pin_revision
-    model = _SegModelClass.from_pretrained(repo_id, **kwargs)
+    model = AutoModelForImageSegmentation.from_pretrained(
+        repo_id, **kwargs
+    )
     model.eval()
     model.to(device_obj)
     return model
 
 # -------------------------
-# Inference Pipeline
+# Inference Pipeline (Local model path)
 # -------------------------
 
 def run_birefnet(
@@ -279,24 +280,97 @@ def compose_alpha(
     return out
 
 # -------------------------
+# Remote HF Inference Endpoint client
+# -------------------------
+
+def numeric_mask_to_png_bytes(mask_list) -> bytes:
+    """Convert a nested list [[floats]] in [0,1] to a PNG (L) byte stream."""
+    import numpy as np
+    arr = np.array(mask_list, dtype=np.float32)
+    arr = (np.clip(arr, 0, 1) * 255).astype("uint8")
+    im = Image.fromarray(arr, mode="L")
+    buf = io.BytesIO()
+    im.save(buf, format="PNG")
+    return buf.getvalue()
+
+
+def call_hf_endpoint(image: Image.Image, endpoint_url: str, hf_token: str, timeout: int = 120) -> Tuple[Optional[bytes], Optional[Image.Image]]:
+    """Send image bytes to a HF Inference Endpoint.
+    Returns (mask_png_bytes, rgba_image) where only one is set depending on what the endpoint returns.
+    We accept either an image/* payload (mask or result image) or JSON with base64 fields.
+    """
+    # Encode input as PNG bytes
+    buf = io.BytesIO()
+    image.save(buf, format="PNG")
+    img_bytes = buf.getvalue()
+
+    headers = {
+        "Authorization": f"Bearer {hf_token}",
+        "Accept": "image/png,application/json",
+        "Content-Type": "application/octet-stream",
+    }
+    r = requests.post(endpoint_url, headers=headers, data=img_bytes, timeout=timeout)
+    r.raise_for_status()
+
+    ctype = r.headers.get("Content-Type", "")
+    if ctype.startswith("image/") or ctype == "application/octet-stream":
+        # The endpoint returned an image. We don't know if it's a mask or the final RGBA.
+        # Caller will decide how to use it (controlled via UI toggle).
+        return r.content, None
+
+    # Try JSON contract
+    try:
+        js = r.json()
+    except Exception:
+        raise RuntimeError(f"Unexpected endpoint response (Content-Type={ctype}, len={len(r.content)}).")
+
+    # Support a few common schemas
+    # 1) {"mask_png_b64": "..."} or {"image_png_b64": "..."}
+    if isinstance(js, dict):
+        for key in ("mask_png_b64", "image_png_b64", "mask", "image"):
+            if key in js and isinstance(js[key], str):
+                try:
+                    raw = base64.b64decode(js[key])
+                    # Heuristic: PNG header
+                    if raw[:8] == PNG_MAGIC:
+                        return raw, None
+                    # Otherwise try to open as a full image (RGBA or RGB)
+                    try:
+                        im = Image.open(io.BytesIO(raw))
+                        return None, im.convert("RGBA")
+                    except Exception:
+                        pass
+                except Exception:
+                    pass
+        # 2) {"mask": [[floats]]} numeric mask → PNG bytes
+        if "mask" in js and isinstance(js["mask"], list):
+            return numeric_mask_to_png_bytes(js["mask"]), None
+
+    raise RuntimeError("Could not interpret endpoint JSON. Expose PNG bytes (mask or result) for best compatibility.")
+
+# -------------------------
 # Streamlit UI
 # -------------------------
 
 st.set_page_config(page_title="BiRefNet Background Removal", layout="wide")
 st.title("🧼 Background Removal (BiRefNet)")
 
-if 'SEG_FALLBACK' in globals() and SEG_FALLBACK:
-    st.warning("Using generic AutoModel fallback (AutoModelForImageSegmentation unavailable). Functionality may be reduced; upgrade transformers on local environment for full support.")
-
 with st.sidebar:
-    st.header("Model & Inference Settings")
+    st.header("Remote Inference (HF Endpoint)")
+    use_endpoint = st.checkbox("Use HF Inference Endpoint (no local model)", value=True)
+    endpoint_url = st.text_input("Endpoint URL", value=DEFAULT_ENDPOINT_URL or "https://e76b464otz1tnrxm.us-east-1.aws.endpoints.huggingface.cloud")
+    hf_token = st.text_input("HF Token", value=st.secrets.get("HF_TOKEN", DEFAULT_HF_TOKEN), type="password")
+    endpoint_return = st.selectbox("Endpoint returns…", ["mask_png", "rgba_png"], index=0,
+                                   help="If your endpoint returns the final composited cutout, choose RGBA.")
+    st.caption("Tip: put HF_TOKEN in Streamlit Secrets for security.")
+
+    st.header("Model & Inference Settings (Local model mode)")
     model_label = st.selectbox("Model", list(MODEL_CHOICES.keys()), index=2)
     repo_id = MODEL_CHOICES[model_label]
 
     force_cpu = st.checkbox("Force CPU (Streamlit Cloud)", value=DEFAULT_FORCE_CPU,
                             help="Cloud has no GPU. Disable locally if you have CUDA/ROCm/DirectML.")
     if (force_cpu and DEVICE_LABEL != "cpu") or ((not force_cpu) and DEVICE_LABEL == "cpu" and torch.cuda.is_available()):
-        # Re-pick device based on toggle
         DEVICE_LABEL, DEVICE_OBJ = pick_device(force_cpu=force_cpu)
 
     st.write(f"**Device:** {DEVICE_LABEL}")
@@ -317,16 +391,20 @@ with st.sidebar:
     if DEVICE_LABEL != "cuda":
         use_autocast = False
 
-    st.header("Mask Post‑processing")
+    st.header("Mask Post‑processing (both modes)")
     soft_mask = st.checkbox("Soft alpha (no threshold)", value=True)
     threshold = None if soft_mask else st.slider("Threshold", 0, 255, 128)
     feather = st.slider("Feather radius (px)", 0, 20, 2)
     invert = st.checkbox("Invert mask (keep background)", value=False)
 
-# Load model (cached)
-# Pin to a known-good revision (update this if you want newer features)
+    st.header("Diagnostics & Unit Tests")
+    run_tests = st.checkbox("Run internal tests", value=False)
+
+# Load model (cached) — only when not using endpoint
 PINNED_REV = "main"  # replace with a commit hash from the HF model card for reproducibility
-model = load_model(repo_id, DEVICE_OBJ, pin_revision=PINNED_REV)
+model = None
+if not use_endpoint:
+    model = load_model(repo_id, DEVICE_OBJ, pin_revision=PINNED_REV)
 
 # Inputs
 left, right = st.columns(2)
@@ -349,44 +427,87 @@ elif url:
     except Exception as e:
         st.error(f"Failed to fetch URL: {e}")
 
+# Optional: run internal tests
+if run_tests:
+    try:
+        # Test 1: PNG signature check
+        assert PNG_MAGIC == b"\x89PNG\r\n\x1a\n"
+        malformed = b"\x89PNG\n\x1a\n"  # wrong (CR missing)
+        st.write("Test 1a (correct signature)", PNG_MAGIC[:4])
+        st.write("Test 1b (malformed signature) ->", malformed[:8] == PNG_MAGIC)
+
+        # Test 2: numeric mask to PNG bytes round-trip
+        mask_list = [
+            [0.0, 0.5],
+            [1.0, 0.25],
+        ]
+        png_bytes = numeric_mask_to_png_bytes(mask_list)
+        assert png_bytes[:8] == PNG_MAGIC
+        img_mask = Image.open(io.BytesIO(png_bytes)).convert("L")
+        st.write("Test 2 (numeric mask PNG size)", img_mask.size)
+        st.success("All tests passed.")
+    except Exception as e:
+        st.exception(e)
+
 # Run
 if img is not None:
     c1, c2 = st.columns(2)
-    with st.spinner("Running BiRefNet…"):
+    with st.spinner("Running…"):
         try:
             t0 = time.perf_counter()
-            mask = run_birefnet(
-                img_rgb=img,
-                model=model,
-                device_label=DEVICE_LABEL,
-                device_obj=DEVICE_OBJ,
-                input_side=input_side,
-                use_letterbox=use_letterbox,
-                use_autocast=use_autocast,
-            )
+            if use_endpoint:
+                # Call remote endpoint
+                payload_bytes, _ = call_hf_endpoint(img, endpoint_url, hf_token)
+                if payload_bytes is None:
+                    raise RuntimeError("Endpoint returned no bytes.")
+                if endpoint_return == "rgba_png":
+                    # Treat bytes as final RGBA image
+                    rgba = Image.open(io.BytesIO(payload_bytes)).convert("RGBA")
+                    result = rgba
+                    mask = None
+                else:
+                    # Treat bytes as a PNG mask
+                    mask = Image.open(io.BytesIO(payload_bytes)).convert("L")
+                    result = compose_alpha(
+                        img_rgb=img,
+                        mask=mask,
+                        threshold=threshold,
+                        feather_radius=feather,
+                        invert=invert,
+                    )
+            else:
+                # Local model path
+                mask = run_birefnet(
+                    img_rgb=img,
+                    model=model,
+                    device_label=DEVICE_LABEL,
+                    device_obj=DEVICE_OBJ,
+                    input_side=input_side,
+                    use_letterbox=use_letterbox,
+                    use_autocast=use_autocast,
+                )
+                result = compose_alpha(
+                    img_rgb=img,
+                    mask=mask,
+                    threshold=threshold,
+                    feather_radius=feather,
+                    invert=invert,
+                )
             t1 = time.perf_counter()
-
-            result = compose_alpha(
-                img_rgb=img,
-                mask=mask,
-                threshold=threshold,
-                feather_radius=feather,
-                invert=invert,
-            )
-            t2 = time.perf_counter()
         except Exception as e:
             st.exception(e)
             st.stop()
 
     with c1:
         st.markdown("**Original**")
-        st.image(img, use_container_width=True)
-        st.markdown("**Predicted Mask (preview)**")
-        st.image(mask, use_container_width=True)
+        st.image(img, use_column_width=True)
+        if (not use_endpoint) or (use_endpoint and 'mask' in locals() and mask is not None):
+            st.markdown("**Mask (preview)**")
+            st.image(mask, use_column_width=True)
 
     with c2:
         st.markdown("**Result (RGBA)**")
-        st.image(result, use_container_width=True)
+        st.image(result, use_column_width=True)
 
         buf = io.BytesIO()
         result.save(buf, format="PNG")
@@ -397,8 +518,11 @@ if img is not None:
             mime="image/png",
         )
 
-    st.info(
-        f"Device: {DEVICE_LABEL} • Inference: {(t1 - t0):.3f}s • Compositing: {(t2 - t1):.3f}s • Total: {(t2 - t0):.3f}s"
-    )
+    if use_endpoint:
+        st.info(f"Endpoint: {endpoint_url} • Total latency: {(t1 - t0):.3f}s")
+    else:
+        st.info(
+            f"Device: {DEVICE_LABEL} • Total: {(t1 - t0):.3f}s"
+        )
 else:
-    st.warning("Upload a file or paste a URL to begin.")
+    st.warning("Upload a file or paste an image URL to begin.")

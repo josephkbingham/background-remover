@@ -294,59 +294,122 @@ def numeric_mask_to_png_bytes(mask_list) -> bytes:
     return buf.getvalue()
 
 
-def call_hf_endpoint(image: Image.Image, endpoint_url: str, hf_token: str, timeout: int = 120) -> Tuple[Optional[bytes], Optional[Image.Image]]:
-    """Send image bytes to a HF Inference Endpoint.
-    Returns (mask_png_bytes, rgba_image) where only one is set depending on what the endpoint returns.
-    We accept either an image/* payload (mask or result image) or JSON with base64 fields.
+def call_hf_endpoint(
+    image: Image.Image,
+    endpoint_url: str,
+    hf_token: str,
+    timeout: int = 120,
+    debug: bool = False,
+) -> Tuple[Optional[bytes], Optional[Image.Image]]:
+    """Robust multi‑strategy call to a HF Inference Endpoint.
+    Tries several common payload formats:
+      1) Raw bytes (application/octet-stream)
+      2) Raw bytes (image/png)
+      3) JSON base64 {"inputs": b64}
+      4) JSON base64 {"image": b64}
+    Interprets responses as either:
+      - direct PNG (mask or final image)
+      - JSON with *png_b64 keys or numeric mask list
+    Returns (mask_png_bytes, rgba_image) where only one is populated.
+    Raises RuntimeError with aggregated attempt info on failure.
     """
-    # Encode input as PNG bytes
     buf = io.BytesIO()
     image.save(buf, format="PNG")
     img_bytes = buf.getvalue()
 
-    headers = {
-        "Authorization": f"Bearer {hf_token}",
+    common_headers = {
+        "Authorization": f"Bearer {hf_token}" if hf_token else "",
         "Accept": "image/png,application/json",
-        "Content-Type": "application/octet-stream",
     }
-    r = requests.post(endpoint_url, headers=headers, data=img_bytes, timeout=timeout)
-    r.raise_for_status()
 
-    ctype = r.headers.get("Content-Type", "")
+    attempts = []  # (label, status_code, snippet)
+
+    def _try(label: str, *, headers: dict, data=None, json_payload=None):
+        try:
+            r = requests.post(
+                endpoint_url,
+                headers=headers,
+                data=data,
+                json=json_payload,
+                timeout=timeout,
+            )
+        except Exception as ex:  # network / timeout
+            attempts.append((label, "EXC", str(ex)[:180]))
+            return None
+        if r.ok:
+            return r
+        # Record failing attempt with body snippet
+        attempts.append((label, r.status_code, r.text[:180]))
+        return None
+
+    b64 = base64.b64encode(img_bytes).decode()
+
+    # Strategy executions
+    resp = _try(
+        "raw-octet",
+        headers={**common_headers, "Content-Type": "application/octet-stream"},
+        data=img_bytes,
+    ) or _try(
+        "raw-png",
+        headers={**common_headers, "Content-Type": "image/png"},
+        data=img_bytes,
+    ) or _try(
+        "json-inputs",
+        headers={**common_headers, "Content-Type": "application/json"},
+        json_payload={"inputs": b64},
+    ) or _try(
+        "json-image",
+        headers={**common_headers, "Content-Type": "application/json"},
+        json_payload={"image": b64},
+    )
+
+    if resp is None:
+        detail = " | ".join(f"{m}:{c}:{s}" for m, c, s in attempts)
+        raise RuntimeError(f"Endpoint attempts failed: {detail}")
+
+    ctype = resp.headers.get("Content-Type", "")
+    content = resp.content
+
+    # Direct image path
     if ctype.startswith("image/") or ctype == "application/octet-stream":
-        # The endpoint returned an image. We don't know if it's a mask or the final RGBA.
-        # Caller will decide how to use it (controlled via UI toggle).
-        return r.content, None
+        return content, None
 
-    # Try JSON contract
+    # JSON path
     try:
-        js = r.json()
+        js = resp.json()
     except Exception:
-        raise RuntimeError(f"Unexpected endpoint response (Content-Type={ctype}, len={len(r.content)}).")
+        raise RuntimeError(
+            f"Unexpected endpoint response (Content-Type={ctype}, len={len(content)})."
+        )
 
-    # Support a few common schemas
-    # 1) {"mask_png_b64": "..."} or {"image_png_b64": "..."}
+    if debug:
+        st.code({k: (str(v)[:120] + '…' if isinstance(v, str) and len(v) > 120 else v) for k, v in list(js.items())[:8]})
+
     if isinstance(js, dict):
+        # Base64 PNG variants
         for key in ("mask_png_b64", "image_png_b64", "mask", "image"):
-            if key in js and isinstance(js[key], str):
+            val = js.get(key)
+            if isinstance(val, str):
                 try:
-                    raw = base64.b64decode(js[key])
-                    # Heuristic: PNG header
-                    if raw[:8] == PNG_MAGIC:
-                        return raw, None
-                    # Otherwise try to open as a full image (RGBA or RGB)
-                    try:
-                        im = Image.open(io.BytesIO(raw))
-                        return None, im.convert("RGBA")
-                    except Exception:
-                        pass
+                    raw = base64.b64decode(val)
                 except Exception:
-                    pass
-        # 2) {"mask": [[floats]]} numeric mask → PNG bytes
-        if "mask" in js and isinstance(js["mask"], list):
-            return numeric_mask_to_png_bytes(js["mask"]), None
+                    continue
+                if raw[:8] == PNG_MAGIC:
+                    return raw, None
+                # Try treat as full image
+                try:
+                    im = Image.open(io.BytesIO(raw))
+                    return None, im.convert("RGBA")
+                except Exception:
+                    continue
+        # Numeric mask list
+        if isinstance(js.get("mask"), list):
+            try:
+                return numeric_mask_to_png_bytes(js["mask"]), None
+            except Exception as ex:
+                raise RuntimeError(f"Failed to convert numeric mask: {ex}")
 
-    raise RuntimeError("Could not interpret endpoint JSON. Expose PNG bytes (mask or result) for best compatibility.")
+    raise RuntimeError("Could not interpret endpoint JSON. Provide PNG bytes or *png_b64 key.")
 
 # -------------------------
 # Streamlit UI
@@ -362,6 +425,7 @@ with st.sidebar:
     hf_token = st.text_input("HF Token", value=st.secrets.get("HF_TOKEN", DEFAULT_HF_TOKEN), type="password")
     endpoint_return = st.selectbox("Endpoint returns…", ["mask_png", "rgba_png"], index=0,
                                    help="If your endpoint returns the final composited cutout, choose RGBA.")
+    endpoint_debug = st.checkbox("Endpoint debug", value=False, help="Show parsed JSON key snippet when calling endpoint.")
     st.caption("Tip: put HF_TOKEN in Streamlit Secrets for security.")
 
     st.header("Model & Inference Settings (Local model mode)")
@@ -457,7 +521,7 @@ if img is not None:
             t0 = time.perf_counter()
             if use_endpoint:
                 # Call remote endpoint
-                payload_bytes, _ = call_hf_endpoint(img, endpoint_url, hf_token)
+                payload_bytes, _ = call_hf_endpoint(img, endpoint_url, hf_token, debug=endpoint_debug)
                 if payload_bytes is None:
                     raise RuntimeError("Endpoint returned no bytes.")
                 if endpoint_return == "rgba_png":

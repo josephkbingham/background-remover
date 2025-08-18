@@ -313,21 +313,19 @@ def call_hf_endpoint(
 
     # Candidate payload builders (label, payload)
     candidates = []
-    # Most common (original attempt) nested image key
-    candidates.append(("inputs.image", {"inputs": {"image": b64_string}}))
-    # Simple inputs = base64 (some handlers treat this as raw input)
-    candidates.append(("inputs-base64", {"inputs": b64_string}))
-    # Flat image key
-    candidates.append(("image", {"image": b64_string}))
-    # Nested bytes variant
-    candidates.append(("inputs.bytes", {"inputs": {"bytes": b64_string}}))
-    # Legacy mask pipeline variant
-    candidates.append(("inputs.data", {"inputs": {"data": b64_string}}))
-    # URL variants if provided
+    # If URL provided, try URL-first variants (some handlers only accept a string URL)
     if source_url:
-        candidates.append(("inputs.url", {"inputs": source_url}))
-        candidates.append(("url", {"url": source_url}))
+        candidates.append(("inputs.url", {"inputs": source_url}))                # simple string URL
         candidates.append(("inputs.image_url", {"inputs": {"image_url": source_url}}))
+        candidates.append(("url", {"url": source_url}))
+        candidates.append(("inputs.image.url", {"inputs": {"image": {"url": source_url}}}))
+    # Base64 variants
+    candidates.append(("inputs.image", {"inputs": {"image": b64_string}}))      # nested image base64
+    candidates.append(("inputs.image.bytes", {"inputs": {"image": {"bytes": b64_string}}}))
+    candidates.append(("inputs-base64", {"inputs": b64_string}))                 # raw base64 string
+    candidates.append(("image", {"image": b64_string}))                          # flat image key
+    candidates.append(("inputs.bytes", {"inputs": {"bytes": b64_string}}))      # bytes key
+    candidates.append(("inputs.data", {"inputs": {"data": b64_string}}))        # data key
 
     headers = {
         "Authorization": f"Bearer {hf_token}" if hf_token else "",
